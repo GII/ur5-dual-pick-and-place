@@ -1,0 +1,38 @@
+# -----------------------------------------------------------------------------
+# motion_planning.yaml
+#
+# Configuración específica del nodo MoveItPy de ur_dual_pick_place.
+# Se carga desde el launch con .moveit_cpp(file_path=...).
+# -----------------------------------------------------------------------------
+
+planning_scene_monitor_options:
+  name: "planning_scene_monitor"
+  robot_description: "robot_description"
+  joint_state_topic: "/joint_states"
+
+  # Topics estándar para que RViz y otros nodos puedan observar la escena.
+  attached_collision_object_topic: "/attached_collision_object"
+  publish_planning_scene_topic: "/monitored_planning_scene"        # escuchar la escena de move_group (con OctoMap)
+  monitored_planning_scene_topic: "/ur_dual/commander_planning_scene"  # publicar en tópico privado para no chocar con move_group
+
+  wait_for_initial_state_timeout: 10.0
+
+planning_pipelines:
+  pipeline_names: ["ompl"]
+
+plan_request_params:
+  planning_attempts: 1
+  planning_pipeline: ompl
+  planner_id: "RRTConnectkConfigDefault"
+  max_velocity_scaling_factor: 0.05
+  max_acceleration_scaling_factor: 0.05
+  planning_time: 15.0
+
+ompl_rrtc:
+  plan_request_params:
+    planning_attempts: 1
+    planning_pipeline: ompl
+    planner_id: "RRTConnectkConfigDefault"
+    max_velocity_scaling_factor: 0.05
+    max_acceleration_scaling_factor: 0.05
+    planning_time: 15.0
