@@ -68,7 +68,6 @@ Two design points are central to the system:
  │    ├── scripts/
  │    │    ├── v1_capture.py                  # Validation V1 (YOLO detection rate) capture
  │    │    ├── v2_capture.py                  # Validation V2 (3D centroid stability) capture
- │    │    └── calibrate_normal_grasp_template.py
  │    ├── package.xml
  │    └── setup.py
  ├── ur_dual_moveit_config/                   # MoveIt 2 configuration for the dual UR5 + SoftHand
