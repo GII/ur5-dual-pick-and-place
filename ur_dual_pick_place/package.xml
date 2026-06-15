@@ -4,7 +4,7 @@
   <name>ur_dual_pick_place</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="alvarez.fabian@outlook.com">gii-exp-1</maintainer>
+  <maintainer email="d.rodriguezriv0@gmail.com">gii-exp-1</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
