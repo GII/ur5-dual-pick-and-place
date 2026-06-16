@@ -30,6 +30,7 @@ setup(
             'object_pose_bridge = ur_dual_pick_place.object_pose_bridge:main',
             'obstacle_clusterer = ur_dual_pick_place.obstacle_clusterer:main',
             'octomap_input_filter = ur_dual_pick_place.octomap_input_filter:main',
+            'pick_place_sequencer = ur_dual_pick_place.pick_place_sequencer:main',
         ],
     },
 )
