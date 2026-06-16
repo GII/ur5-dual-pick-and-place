@@ -228,27 +228,27 @@ ros2 service call /ur_dual/freeze_octomap std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/plan_pregrasp_from_latest_pose std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool "{data: true}"
 
-# Straight descent onto the object (3 cm), then close + attach
+# Straight descent onto the object (3 cm), then close 
 ros2 param set /ur_dual_commander offset_test_dz -0.03
 ros2 service call /ur_dual/plan_offset_test std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool "{data: true}"
 ros2 service call /ur_dual/close_hand std_srvs/srv/Trigger "{}"
-ros2 service call /ur_dual/attach_grasped_object std_srvs/srv/Trigger "{}"
 
-# Lift (4 cm), move to ready, then to the place pose
+# Lift (4 cm) + attach, move to ready, then to the place pose
 ros2 param set /ur_dual_commander offset_test_dz 0.04
 ros2 service call /ur_dual/plan_offset_test std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool "{data: true}"
+ros2 service call /ur_dual/attach_grasped_object std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/plan_ready_right std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool "{data: true}"
 ros2 service call /ur_dual/plan_place_normal std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool "{data: true}"
 
 # Descend at the place (3 cm), release, retreat, reset
+ros2 service call /ur_dual/detach_grasped_object std_srvs/srv/Trigger "{}"
 ros2 param set /ur_dual_commander offset_test_dz -0.03
 ros2 service call /ur_dual/plan_offset_test std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool "{data: true}"
-ros2 service call /ur_dual/detach_grasped_object std_srvs/srv/Trigger "{}"
 ros2 service call /ur_dual/open_hand std_srvs/srv/Trigger "{}"
 ros2 param set /ur_dual_commander offset_test_dz 0.04
 ros2 service call /ur_dual/plan_offset_test std_srvs/srv/Trigger "{}"
