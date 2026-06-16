@@ -1,15 +1,3 @@
-"""
-ur_dual_command.launch.py
-
-Brings up the manipulation back-end:
-  - octomap_input_filter : category-aware depth filter (removes the target
-                           object's voxels so the OctoMap never blocks the grasp)
-  - ur_dual_commander    : MoveItPy commander exposing the pick-and-place services
-
-The commander is loaded with the MoveIt config + motion_planning.yaml so its
-MoveItPy planning pipelines come up correctly.
-"""
-
 import os
 
 from launch import LaunchDescription
