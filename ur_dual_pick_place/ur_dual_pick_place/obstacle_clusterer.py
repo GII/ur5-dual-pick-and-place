@@ -2,11 +2,14 @@
 # -----------------------------------------------------------------------------
 # obstacle_clusterer.py
 #
+#
+# IMPORTANTE: nodo solo utilizado para probar distintas maneras de resolver
+# el problema de los obstaculos, al final Octomap fue el elegido.
+#
+#
 # Detecta obstáculos automáticamente desde la nube de puntos de la OAK-D y los
 # publica como CollisionObjects en el planning scene de MoveIt.
 #
-# Activación: servicio /ur_dual/update_obstacles (Trigger).
-# El commander llama a este servicio ANTES de cada planificación.
 #
 # Pipeline:
 #   1. Capturar el último frame depth + camera_info.
