@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V1 — Prueba de confianza del detector visual (TFG, sección 3.13.2)
+V1 — Prueba de confianza del detector visual
 
 Captura interactiva por posición:
   - El usuario coloca el objeto en una posición fija de la matriz de
@@ -11,21 +11,9 @@ Captura interactiva por posición:
     timeout de seguridad).
   - Cierra la ventana, calcula media y σ de confianza dentro de la
     ventana. Ese valor representa "la confianza en esa posición".
-  - Se repite para las 20 posiciones de la matriz.
-  - Al final reporta media y σ sobre los 20 valores por posición (los
-    datos que se llevan al Capítulo 4) y la tasa de detección (M4).
+  - Se repite para las 20 posiciones de la matriz..
 
-Diseño acordado con Emanuel (rev.): en lugar de fijar la ventana en
-2-3 s (que a 0.7 Hz dejaba a veces ventanas con 0-1 muestras útiles),
-se fija el número de detecciones válidas a recoger por posición. Esto
-mantiene comparables las estadísticas entre posiciones aunque el flujo
-de visión tenga huecos puntuales.
-
-Métricas evaluadas (solo V1):
-  M4 — proporción de detecciones correctas (hits / posiciones).
-  Diagnóstico — media y σ de la confianza emitida por YOLO.
-
-NO se evalúa aquí la precisión de localización 3D — eso es V2 y va en
+NO se evalúa aquí la precisión de localización 3D, eso es V2 y va en
 otro script aparte.
 
 Uso:
