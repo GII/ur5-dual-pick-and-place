@@ -46,8 +46,6 @@ class ObjectPoseBridge(Node):
         self.declare_parameter("target_frame", "ur_dual_I_base_link")
 
         # Si queda vacío, toma el objeto de mayor confianza.
-        # Para probar con la vaca:
-        #   -p target_class:=vaca
         self.declare_parameter("target_class", "")
 
         self.declare_parameter("min_confidence", 0.50)
@@ -180,16 +178,9 @@ class ObjectPoseBridge(Node):
 
         self.pub.publish(pose_base)
 
-
-        # Publicar también la clase del objeto seleccionado, para que
-        # el commander pueda usarla en clear_octomap_around_object y
-        # en la elección de tolerancias del orientation constraint.
         class_msg = String()
         class_msg.data = str(best.class_name)
         self.class_pub.publish(class_msg)
-
-
-
 
         now = time.monotonic()
         if now - self.last_log_time > 1.0:
