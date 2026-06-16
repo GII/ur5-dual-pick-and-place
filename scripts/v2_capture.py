@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V2 — Prueba de estabilidad del centroide 3D (TFG, sección 3.13.3)
+V2 — Prueba de estabilidad del centroide 3D 
 
 Captura interactiva por posición (objeto físicamente inmóvil):
   - El usuario coloca el objeto en una posición fija de un conjunto
@@ -14,14 +14,6 @@ Captura interactiva por posición (objeto físicamente inmóvil):
         · desviaciones estándar por eje σ_x, σ_y, σ_z
         · desviación estándar tridimensional σ_xyz = √(σ_x²+σ_y²+σ_z²)
   - Se repite para todas las posiciones.
-  - Al final reporta media de σ por eje y σ_xyz entre las distintas
-    posiciones para caracterizar la consistencia espacial del flujo de
-    visión (M5 del informe — análisis fino se hace en Cap. 4).
-
-Diseño acordado con Emanuel: número alto de repeticiones por posición
-(20-30), pocas posiciones (5-7), criterio de captura por número de
-muestras válidas (no por tiempo) para no dejar ventanas con huecos
-por detecciones puntuales fallidas.
 
 NO evalúa confianza como métrica principal (eso es V1), aunque se
 registra como diagnóstico complementario.
