@@ -1,3 +1,15 @@
+"""
+ur_dual_command.launch.py
+
+Brings up the manipulation back-end:
+  - octomap_input_filter : category-aware depth filter (removes the target
+                           object's voxels so the OctoMap never blocks the grasp)
+  - ur_dual_commander    : MoveItPy commander exposing the pick-and-place services
+
+The commander is loaded with the MoveIt config + motion_planning.yaml so its
+MoveItPy planning pipelines come up correctly.
+"""
+
 import os
 
 from launch import LaunchDescription
@@ -40,7 +52,6 @@ def generate_launch_description():
                 "min_depth_m": 0.45,
                 "max_depth_m": 1.25,
 
-                # Ajustaremos estos rangos con ros2 param set si hace falta.
                 "min_x": -0.75,
                 "max_x": 0.25,
                 "min_y": 0.35,
