@@ -5,9 +5,6 @@ Launch del nodo move_group con OctoMap habilitado y, MUY IMPORTANTE,
 con publicación del planning scene completo habilitada para que otros
 nodos (como el commander MoveItPy) puedan ver el OctoMap.
 
-Por defecto, generate_move_group_launch() crea move_group con
-publish_planning_scene=False, así que el OctoMap se mantiene dentro
-de move_group y no se distribuye. Acá lo habilitamos explícitamente.
 """
 
 from launch import LaunchDescription
@@ -23,12 +20,10 @@ def generate_launch_description():
         .to_moveit_configs()
     )
 
-    # ============================================================
     # Parámetros adicionales para que move_group PUBLIQUE el
     # planning scene completo (incluyendo OctoMap) a los suscriptores.
     # Sin esto, el commander MoveItPy mantiene su escena local vacía
     # y el OctoMap nunca llega a sus planificaciones.
-    # ============================================================
     move_group_capabilities_params = {
         # CRÍTICO: publicar la escena completa, no solo diffs.
         "publish_planning_scene": True,
