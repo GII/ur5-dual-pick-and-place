@@ -2,14 +2,9 @@
 # -----------------------------------------------------------------------------
 # ur_dual_command_services.py
 #
-# Nodo comandante estilo TIAGo:
-#   - No usa input()
-#   - No planifica automáticamente al iniciar
-#   - Expone servicios ROS2 para planificar y ejecutar
-#
-# Servicios:
-#   /ur_dual/plan_home_right
-#   /ur_dual/execute_last_plan
+# Pick-and-place commander (extends UrDualMoveItPy). It exposes the whole cycle
+# as ROS 2 services so each step can be planned, inspected in RViz and executed
+# separately. It never plans automatically on startup and never blocks on input().
 # -----------------------------------------------------------------------------
 
 import time
@@ -39,11 +34,8 @@ from ur_dual_pick_place.ur_dual_moveit_py import UrDualMoveItPy
 
 
 def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
-    """Convierte roll, pitch, yaw a quaternion.
-
-    Convención XYZ intrínseca, suficiente para definir orientaciones fijas
-    de pre-grasp.
-    """
+    """Convert roll, pitch, yaw to a quaternion (intrinsic XYZ), enough for the
+    fixed pre-grasp orientations."""
 
     cr = math.cos(roll * 0.5)
     sr = math.sin(roll * 0.5)
@@ -62,9 +54,8 @@ def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
 
 
 
-# ============================================================
-# Dimensiones aproximadas (size_x, size_y, size_z) en metros 
-# ============================================================
+
+# Approximate object sizes (size_x, size_y, size_z) in metres.
 OBJECT_DIMENSIONS = {
     "bola":         (0.080, 0.080, 0.080),
     "botella rosa": (0.063, 0.063, 0.200),
@@ -80,30 +71,18 @@ OBJECT_DIMENSIONS = {
 OBJECT_DIM_DEFAULT = (0.120, 0.120, 0.140)
 
 
-# ============================================================
-# Tolerancias del OrientationConstraint del pre-grasp por categoría.
-# Cada tupla es (tol_roll, tol_pitch, tol_yaw) en radianes alrededor
-# de la orientación de referencia (la del template de pregrasp).
-#
-# Filosofía:
-#   - roll/pitch estrictos (~0.10 rad ≈ 6°) mantienen la palma orientada
-#     correctamente (hacia abajo para objetos en mesa, a 90° para botellas).
-#   - yaw libre (3.14 rad = ±π) deja que OMPL elija cualquier ángulo de
-#     aproximación alrededor del eje vertical, ampliando soluciones IK.
-#
-# Para peluches blandos (lechuga, tomate) y bolas, las tolerancias son
-# más permisivas porque la SoftHand envuelve bien desde cualquier ángulo.
-# ============================================================
+# Per-class OrientationConstraint tolerances for the pre-grasp.
+# Each tuple is (tol_roll, tol_pitch, tol_yaw) in radians 
 GRASP_TOLERANCES = {
     "bola":         (0.10, 0.10, 3.14),   
-    "botella rosa": (0.10, 0.10, 3.14),   # palma 90° fija, yaw libre
+    "botella rosa": (0.10, 0.10, 3.14),
     "caballo":      (0.10, 0.10, 3.14),
     "cubo":         (0.10, 0.10, 3.14),
-    "lechuga":      (1.50, 1.50, 3.14),   # peluche, permisivo
+    "lechuga":      (1.50, 1.50, 3.14), 
     "pina":         (0.10, 0.10, 3.14),
     "prisma":       (0.10, 0.10, 3.14),
     "refresco":     (0.10, 0.10, 3.14),
-    "tomate":       (1.50, 1.50, 3.14),   # peluche, permisivo
+    "tomate":       (1.50, 1.50, 3.14),   
     "vaca":         (0.10, 0.10, 3.14),
 }
 GRASP_TOLERANCE_DEFAULT = (0.10, 0.10, 3.14)
@@ -156,7 +135,6 @@ class UrDualCommandServices(UrDualMoveItPy):
         )
 
 
-        # Publisher al planning_scene para attach/detach del objeto agarrado.
         self.planning_scene_pub = self.create_publisher(
             PlanningScene,
             "/planning_scene",
@@ -164,32 +142,24 @@ class UrDualCommandServices(UrDualMoveItPy):
         )
 
 
-        self.update_obstacles_client = self.create_client(
-            Trigger,
-            "/ur_dual/update_obstacles",
-            callback_group=self.cb_internal_client,
-        )        
 
 
 
-        # TF: lo usamos para leer la pose actual del tool0 y generar
-        # una prueba cartesiana segura con un pequeño offset.
+        # TF: used to read the current tool0 pose and build a relative Cartesian move.
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Parámetros de la prueba cartesiana.
-        # Default: mover el tool0 -5 cm en Z respecto a su pose actual.
+        # Relative Cartesian move parameters (used by plan_offset_test for
+        # descend/lift): move the pose_link by (dx, dy, dz) from its current pose.
         self.declare_parameter("offset_test_base_frame", "ur_dual_I_base_link")
         self.declare_parameter("offset_test_pose_link", "ur_dual_I_tool0")
         self.declare_parameter("offset_test_dx", 0.0)
         self.declare_parameter("offset_test_dy", 0.0)
         self.declare_parameter("offset_test_dz", -0.1)
 
-        # Parámetros para pre-grasp a partir de pose de objeto.
+        # Pre-grasp parameters derived from the detected object pose.
         self.declare_parameter("pregrasp_base_frame", "ur_dual_I_base_link")
-        # Pre-grasp normal para objetos con palma paralela a la mesa.
-        # Usamos tool0 como link de planificación y compensamos la distancia
-        # física hacia la palma.
+        # Pre-grasp for top-grasp objects (palm parallel to the table).
         self.declare_parameter("palm_z_offset", 0.144)
         self.declare_parameter("approach_height", 0.25)
         self.declare_parameter("pregrasp_roll", math.pi)
@@ -199,30 +169,26 @@ class UrDualCommandServices(UrDualMoveItPy):
         self.declare_parameter("cartesian_pregrasp_pose_link", "ur_dual_I_tool0")
 
 
-        # Modo de agarre:
-        #   normal -> vaca, cubo, bola, lego, etc.
-        #   bottle -> botellas
+        # Grasp mode: "normal" (top grasp) or "bottle" (lateral grasp).
         self.declare_parameter("grasp_mode", "normal")
 
-        # Plantilla para objetos normales.
-        # Para el entregable mínimo usamos centro del objeto en X/Y y solo offset en Z.
+        # Template for top-grasp objects (object centre in X/Y, Z offset only).
         self.declare_parameter("normal_grasp_dx", 0.0)
         self.declare_parameter("normal_grasp_dy", 0.0)
         self.declare_parameter("normal_grasp_dz", 0.040)
 
-        # Orientación normal nueva, no inclinada.
+        # Top-grasp reference orientation (not tilted).
         self.declare_parameter("normal_grasp_qx", -0.003)
         self.declare_parameter("normal_grasp_qy", 0.023)
         self.declare_parameter("normal_grasp_qz", -0.022)
         self.declare_parameter("normal_grasp_qw", 0.999)
 
-        # Plantilla para botellas.
-        # X/Y/Z se ajustan después con prueba real sobre botella.
+        # Template for bottles (lateral approach; tune the offsets per setup).
         self.declare_parameter("bottle_grasp_dx", 0.0)
         self.declare_parameter("bottle_grasp_dy", 0.0)
         self.declare_parameter("bottle_grasp_dz", 0.0)
 
-        # Orientación promedio de las dos poses de botella.
+        # Averaged bottle grasp orientation.
         self.declare_parameter("bottle_grasp_qx", -0.008)
         self.declare_parameter("bottle_grasp_qy", 0.680)
         self.declare_parameter("bottle_grasp_qz", 0.028)
@@ -231,28 +197,22 @@ class UrDualCommandServices(UrDualMoveItPy):
         self.declare_parameter("pregrasp_pose_link", "qbhand2m1_palm_link")
         self.declare_parameter("pregrasp_orientation_mode", "grasp_template")
 
-        # ============================================================
-        # Attached object: configuración geométrica del objeto agarrado.
-        # Por defecto se modela como una caja conservadora. Los nombres
-        # asocian con la clase YOLO detectada. Para el TFG usamos un
-        # tamaño único por categoría; un bbox dinámico desde la nube
-        # sería trabajo futuro.
-        # ============================================================
+        # Attached object geometry. The grasped object is modelled as a
+        # conservative box attached to the hand; one fixed size per category
+        # (a dynamic bbox from the point cloud would be future work).
         self.declare_parameter("attached_object_id", "grasped_object")
         self.declare_parameter("attached_object_frame", "qbhand2m1_palm_link")
-        # Tamaño de la caja en metros (ancho, profundo, alto).
-        # Tamaño conservador que cubre vaca/cubo/botella pequeña.
+        # Box size in metres (width, depth, height).
         self.declare_parameter("attached_object_size_x", 0.08)
         self.declare_parameter("attached_object_size_y", 0.08)
         self.declare_parameter("attached_object_size_z", 0.12)
-        # Offset del centro de la caja respecto al frame de la mano.
-        # El centro de la mano cerrada con un objeto agarrado típicamente
-        # queda un poco delante de palm_link.
+        # Offset of the box centre relative to the hand frame (a grasped object
+        # usually sits slightly in front of palm_link).
         self.declare_parameter("attached_object_offset_x", 0.0)
         self.declare_parameter("attached_object_offset_y", 0.0)
         self.declare_parameter("attached_object_offset_z", -0.05)
-        # Margen extra en cada eje al limpiar voxels del octomap alrededor
-        # del objeto. Tolera errores de pose YOLO de hasta este valor (m).
+        # Extra per-axis margin when clearing octomap voxels around the object;
+        # absorbs pose-vs-surface offset up to this value (m).
         self.declare_parameter("clear_box_margin", 0.02)
         
 
@@ -269,11 +229,6 @@ class UrDualCommandServices(UrDualMoveItPy):
             self._on_plan_offset_test,
         )
 
-        self.create_service(
-            Trigger,
-            "/ur_dual/plan_pregrasp_cartesian_from_latest_pose",
-            self._on_plan_pregrasp_cartesian_from_latest_pose,
-        )
 
         self.create_service(
             Trigger,
@@ -325,15 +280,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
 
-        # ============================================================
-        # Servicios para FREEZE / UNFREEZE del OctoMap.
-        # Mecanismo: stop/start del driver de la OAK.
-        # Cuando la cámara no publica, el DepthImageOctomapUpdater no
-        # recibe frames y el OctoMap queda congelado en su último estado.
-        # Cuando volvemos a start, la cámara publica de nuevo y OctoMap
-        # se actualiza otra vez (manteniendo voxels viejos por persistencia
-        # hasta que el ray-casting los limpie).
-        # ============================================================
+        # FREEZE / UNFREEZE the OctoMap
         self.create_service(
             Trigger,
             "/ur_dual/freeze_octomap",
@@ -345,7 +292,7 @@ class UrDualCommandServices(UrDualMoveItPy):
             self._on_unfreeze_octomap,
         )
 
-        # Clientes a los servicios stop/start de la OAK.
+        # Clients for the OAK stop/start services.
         self.oak_stop_client = self.create_client(
             Trigger,
             "/oak_cam/oak/stop_camera",
@@ -359,11 +306,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
 
-        # ============================================================
-        # Servicios para attach / detach del objeto agarrado.
-        # attach: llamar JUSTO DESPUÉS de close_hand exitoso.
-        # detach: llamar JUSTO ANTES de open_hand en el place.
-        # ============================================================
+        # Attach / detach the grasped object. attach: right after a successful
+        # close_hand; detach: right after open_hand 
         self.create_service(
             Trigger,
             "/ur_dual/clear_octomap_around_object",
@@ -382,33 +326,27 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
 
-        # Flag de estado: True si el OctoMap está congelado (cámara parada).
+        # True while the OctoMap is frozen (camera stopped).
         self._octomap_frozen = False
-        # Flag de estado: True si hay un objeto attached al palm_link actualmente.
+        # True while an object is attached to the hand.
         self._object_attached = False
 
-        # Última clase del objeto detectado. La publica object_pose_bridge.
-        # La usamos para elegir dimensiones en clear_octomap_around_object
-        # y tolerancias en el orientation constraint del pregrasp.
+        # Latest detected object class (from object_pose_bridge). Drives the
+        # clear box size and the pre-grasp orientation tolerances.
         self._latest_object_class = None
 
 
 
         self.get_logger().info(
-            "Servicios disponibles:\n"
-            "  ros2 service call /ur_dual/plan_home_right std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/plan_offset_test std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/plan_pregrasp_from_latest_pose std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool \"{data: true}\"\n"
-            "  ros2 service call /ur_dual/execute_last_plan std_srvs/srv/SetBool \"{data: false}\""
-            "  ros2 service call /ur_dual/plan_pregrasp_cartesian_from_latest_pose std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/plan_ready_right std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/clear_octomap std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/freeze_octomap std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/unfreeze_octomap std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/attach_grasped_object std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/detach_grasped_object std_srvs/srv/Trigger \"{}\"\n"
-            "  ros2 service call /ur_dual/clear_octomap_around_object std_srvs/srv/Trigger \"{}\"\n"
+            "Pick-and-place services ready. Plan with a service, inspect in\n"
+            "RViz, then execute with /ur_dual/execute_last_plan.\n"
+            "  pregrasp : /ur_dual/plan_pregrasp_from_latest_pose\n"
+            "  descend/lift : /ur_dual/plan_offset_test (set offset_test_dz)\n"
+            "  hand     : /ur_dual/close_hand , /ur_dual/open_hand\n"
+            "  attach   : /ur_dual/attach_grasped_object , detach_grasped_object\n"
+            "  named    : /ur_dual/plan_ready_right , plan_place_normal , plan_place_bottle\n"
+            "  octomap  : /ur_dual/freeze_octomap , unfreeze_octomap , clear_octomap_around_object\n"
+            "  execute  : /ur_dual/execute_last_plan {data: true|false}"
         )
 
     def _on_joint_state(self, msg: JointState):
@@ -416,12 +354,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
     def _on_object_pose(self, msg: PoseStamped):
-        """Guarda la última pose de objeto recibida.
-
-        La pose debe llegar ya transformada al frame base del robot.
-        El log se limita en frecuencia para no saturar la consola mientras
-        el bridge publica continuamente detecciones.
-        """
+        """Cache the latest object pose (already in the robot base frame). Logging
+        is rate-limited because the bridge publishes detections continuously."""
 
         if not msg.header.frame_id:
             self.get_logger().warn("Pose de objeto recibida sin frame_id. Se ignora.")
@@ -480,13 +414,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
     def _make_pregrasp_pose_from_latest_object(self) -> PoseStamped | None:
-        """Crea una pose pre-grasp desde la última pose de objeto.
-
-        Para objetos normales:
-        - El TCP lógico es qbhand2m1_palm_link.
-        - La posición se calcula como object_pose + offset aprendido.
-        - La orientación se toma de la pose enseñada manualmente.
-        """
+        """Build a pre-grasp pose from the latest object pose: position =
+        object pose + per-mode offset, orientation = the taught template."""
 
         if self.latest_object_pose is None:
             self.get_logger().error(
@@ -511,9 +440,7 @@ class UrDualCommandServices(UrDualMoveItPy):
         pregrasp.header.frame_id = base_frame
         pregrasp.header.stamp = self.get_clock().now().to_msg()
 
-        # ------------------------------------------------------------
-        # Modo principal: plantilla aprendida para objetos normales.
-        # ------------------------------------------------------------
+
         if orientation_mode in ("normal_grasp", "grasp_template"):
             grasp_mode = self.get_parameter("grasp_mode").value
 
@@ -550,9 +477,7 @@ class UrDualCommandServices(UrDualMoveItPy):
                 f"dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}"
             )
 
-        # ------------------------------------------------------------
-        # Fallback: usar orientación actual del link.
-        # ------------------------------------------------------------
+        # Fallback: use the link's current orientation.
         elif orientation_mode == "current_tf":
             approach_height = float(self.get_parameter("approach_height").value)
 
@@ -576,9 +501,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
             position_mode = "CURRENT_TF: object + approach_height"
 
-        # ------------------------------------------------------------
-        # Fallback: orientación por RPY.
-        # ------------------------------------------------------------
+        # Fallback: orientation from RPY.
         else:
             palm_z_offset = float(self.get_parameter("palm_z_offset").value)
             approach_height = float(self.get_parameter("approach_height").value)
@@ -622,12 +545,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
     def _make_offset_pose_from_current_tool(self):
-        """Lee la pose actual del pose_link por TF y crea una pose objetivo
-        desplazada por un offset pequeño.
-
-        Esta prueba valida la planificación hacia PoseStamped sin depender
-        todavía del stereo/YOLO.
-        """
+        """Read the current pose_link pose via TF and return a target pose shifted
+        by (offset_test_d{x,y,z}). Orientation is kept; used by plan_offset_test."""
 
         base_frame = self.get_parameter("offset_test_base_frame").value
         pose_link = self.get_parameter("offset_test_pose_link").value
@@ -657,8 +576,7 @@ class UrDualCommandServices(UrDualMoveItPy):
         pose.pose.position.y = transform.transform.translation.y + dy
         pose.pose.position.z = transform.transform.translation.z + dz
 
-        # Conservamos la misma orientación actual del tool0.
-        # Así evitamos IK raro o giros inesperados en esta primera prueba.
+        # Keep tool0's current orientation to avoid odd IK or unexpected twists.
         pose.pose.orientation = transform.transform.rotation
 
         self.get_logger().info(
@@ -675,206 +593,13 @@ class UrDualCommandServices(UrDualMoveItPy):
         return pose
 
 
-    def _make_cartesian_pregrasp_waypoints_from_latest_object(self):
-        """Genera waypoints cartesianos desde la pose actual hacia el pre-grasp.
-
-        Estrategia:
-        1. Mantener orientación actual del tool0.
-        2. Mover X/Y sobre el objeto a una altura segura.
-        3. Bajar a pre-grasp.
-        """
-
-        if self.latest_object_pose is None:
-            self.get_logger().error(
-                "No hay pose de objeto todavía. Publica primero en /ur_dual/object_pose."
-            )
-            return None
-
-        object_pose = self.latest_object_pose
-
-        base_frame = "ur_dual_I_base_link"
-
-        if object_pose.header.frame_id != base_frame:
-            self.get_logger().error(
-                f"Por ahora la pose de objeto debe venir en frame '{base_frame}', "
-                f"pero llegó en '{object_pose.header.frame_id}'."
-            )
-            return None
-
-        pose_link = self.get_parameter("cartesian_pregrasp_pose_link").value
-
-        palm_z_offset = float(self.get_parameter("palm_z_offset").value)
-        approach_height = float(self.get_parameter("approach_height").value)
-        cartesian_safe_z = float(self.get_parameter("cartesian_safe_z").value)
-
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                base_frame,
-                pose_link,
-                Time(),
-                timeout=Duration(seconds=2.0),
-            )
-        except Exception as exc:
-            self.get_logger().error(
-                f"No se pudo leer TF {base_frame} <- {pose_link}: {exc}"
-            )
-            return None
-
-        current_x = transform.transform.translation.x
-        current_y = transform.transform.translation.y
-        current_z = transform.transform.translation.z
-        current_orientation = transform.transform.rotation
-
-        final_z = object_pose.pose.position.z + palm_z_offset + approach_height
-
-        # Altura de tránsito:
-        # - Si el robot ya está más bajo que cartesian_safe_z, NO lo obligamos a subir.
-        # - Si está muy bajo, lo mantenemos al menos 10 cm sobre el pre-grasp.
-        min_transit_z = final_z + 0.10
-        transit_z = min(current_z, cartesian_safe_z)
-        transit_z = max(transit_z, min_transit_z)
-
-        self.get_logger().info(
-            f"Altura de tránsito calculada: current_z={current_z:.3f}, "
-            f"cartesian_safe_z={cartesian_safe_z:.3f}, "
-            f"final_z={final_z:.3f}, transit_z={transit_z:.3f}"
-        )
-
-
-        waypoints = []
-
-        # Waypoint 1: bajar en Z desde la pose actual, manteniendo X/Y actuales.
-        waypoint_down = PoseStamped()
-        waypoint_down.header.frame_id = base_frame
-        waypoint_down.header.stamp = self.get_clock().now().to_msg()
-        waypoint_down.pose.position.x = current_x
-        waypoint_down.pose.position.y = current_y
-        waypoint_down.pose.position.z = transit_z
-        waypoint_down.pose.orientation = current_orientation
-        waypoints.append(waypoint_down)
-
-        # Waypoint 2: moverse en X/Y hacia encima del objeto, manteniendo altura de tránsito.
-        waypoint_xy = PoseStamped()
-        waypoint_xy.header.frame_id = base_frame
-        waypoint_xy.header.stamp = self.get_clock().now().to_msg()
-        waypoint_xy.pose.position.x = object_pose.pose.position.x
-        waypoint_xy.pose.position.y = object_pose.pose.position.y
-        waypoint_xy.pose.position.z = transit_z
-        waypoint_xy.pose.orientation = current_orientation
-        waypoints.append(waypoint_xy)
-
-        # Waypoint 3: bajar a pre-grasp.
-        waypoint_pregrasp = PoseStamped()
-        waypoint_pregrasp.header.frame_id = base_frame
-        waypoint_pregrasp.header.stamp = self.get_clock().now().to_msg()
-        waypoint_pregrasp.pose.position.x = object_pose.pose.position.x
-        waypoint_pregrasp.pose.position.y = object_pose.pose.position.y
-        waypoint_pregrasp.pose.position.z = final_z
-        waypoint_pregrasp.pose.orientation = current_orientation
-        waypoints.append(waypoint_pregrasp)
-
-        self.get_logger().info(
-            "Waypoints cartesianos pre-grasp generados:\n"
-            f"  pose_link: {pose_link}\n"
-            f"  current xyz: x={current_x:.3f}, y={current_y:.3f}, z={current_z:.3f}\n"
-            f"  objeto xyz: x={object_pose.pose.position.x:.3f}, "
-            f"y={object_pose.pose.position.y:.3f}, z={object_pose.pose.position.z:.3f}\n"
-            f"  waypoint down: x={waypoint_down.pose.position.x:.3f}, "
-            f"y={waypoint_down.pose.position.y:.3f}, "
-            f"z={waypoint_down.pose.position.z:.3f}\n"
-            f"  waypoint XY: x={waypoint_xy.pose.position.x:.3f}, "
-            f"y={waypoint_xy.pose.position.y:.3f}, "
-            f"z={waypoint_xy.pose.position.z:.3f}\n"
-            f"  waypoint pregrasp: x={waypoint_pregrasp.pose.position.x:.3f}, "
-            f"y={waypoint_pregrasp.pose.position.y:.3f}, "
-            f"z={waypoint_pregrasp.pose.position.z:.3f}\n"
-            f"  palm_z_offset={palm_z_offset:.3f}, "
-            f"approach_height={approach_height:.3f}, "
-            f"cartesian_safe_z/transit_z={transit_z:.3f}"
-        )
-
-        return waypoints, pose_link
-
-
-    def _on_plan_pregrasp_cartesian_from_latest_pose(self, request, response):
-        """Planifica hacia pre-grasp usando solo Cartesian Path por waypoints."""
-
-        self.get_logger().info(
-            "Servicio recibido: plan_pregrasp_cartesian_from_latest_pose"
-        )
-
-        self.pending_plan_result = None
-
-        if not self._wait_for_joint_state(timeout_s=5.0):
-            response.success = False
-            response.message = (
-                "No se recibió /joint_states. ¿Está corriendo start_robot.launch.py?"
-            )
-            return response
-
-        result = self._make_cartesian_pregrasp_waypoints_from_latest_object()
-
-        if result is None:
-            response.success = False
-            response.message = "No se pudieron generar waypoints cartesianos."
-            return response
-
-        waypoints, pose_link = result
-
-        success, status, plan_result = self.cartesian_plan_through_poses(
-            arm="right",
-            poses=waypoints,
-            pose_link=pose_link,
-            max_step=0.005,
-            jump_threshold=0.0,
-            min_fraction=0.95,
-            timeout_s=15.0,
-            check_cable=True,
-            start_joint_state_msg=self.latest_joint_state,
-        )
-
-        if not success:
-            self.pending_plan_result = None
-
-            if status == "CABLE_MOTION_TOO_LARGE" and plan_result is not None:
-                self.get_logger().warn(
-                    "Plan cartesiano rechazado por cable. "
-                    "Se publicará en RViz solo para diagnóstico. NO queda ejecutable."
-                )
-                self._publish_plan_for_rviz(plan_result, n_times=5, period_s=0.5)
-
-                response.success = False
-                response.message = (
-                    "Plan cartesiano encontrado pero rechazado por cable. "
-                    "Publicado en RViz solo para diagnóstico. NO ejecutar."
-                )
-                return response
-
-            response.success = False
-            response.message = f"Plan cartesiano pre-grasp falló. Status: {status}"
-            return response
-
-        self.pending_plan_result = plan_result
-        self._publish_plan_for_rviz(plan_result, n_times=5, period_s=0.5)
-
-        response.success = True
-        response.message = (
-            "Plan cartesiano pre-grasp generado y publicado en RViz. "
-            "Revisa trayectoria antes de ejecutar."
-        )
-        return response
-
-
     def _on_plan_pregrasp_from_latest_pose(self, request, response):
-        """Planifica desde el estado actual hacia una pose pre-grasp.
-
-        Este movimiento usa OMPL, pero queda protegido por el chequeo general
-        de joints/cable que está en ur_dual_moveit_py.py.
-        """
+        """Plan (OMPL, best-of-N, cable-protected) from the current state to the
+        pre-grasp pose. Does not execute; leaves a pending plan for RViz review."""
 
         self.get_logger().info("Servicio recibido: plan_pregrasp_from_latest_pose")
         
-        # Descartamos planes anteriores para evitar ejecutar trayectorias viejas.
+        # Drop any previous plan so a stale trajectory cannot be executed.
         self.pending_plan_result = None
 
         if not self._wait_for_joint_state(timeout_s=5.0):
@@ -896,8 +621,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
 
-        # Tolerancias del OrientationConstraint según clase YOLO.
-        # Si no hay clase, default a roll/pitch estrictos + yaw libre.
+        # OrientationConstraint tolerances by YOLO class (default: strict
+        # roll/pitch, free yaw).
         obj_class = self._latest_object_class
         if obj_class in GRASP_TOLERANCES:
             tol_roll, tol_pitch, tol_yaw = GRASP_TOLERANCES[obj_class]
@@ -928,10 +653,8 @@ class UrDualCommandServices(UrDualMoveItPy):
         if not success:
             self.pending_plan_result = None
 
-            # Caso importante:
-            # MoveIt sí encontró una trayectoria, pero nuestro filtro de cable
-            # la rechazó. La publicamos SOLO para verla en RViz, pero NO queda
-            # ejecutable.
+            # MoveIt found a trajectory but the cable filter rejected it. Publish
+            # it to RViz for diagnosis only; it is NOT left pending for execution.
             if status == "CABLE_MOTION_TOO_LARGE" and plan_result is not None:
                 self.get_logger().warn(
                     "El plan fue rechazado por protección de cable, "
@@ -960,7 +683,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
         self.pending_plan_result = plan_result
 
-        # Menos repeticiones para evitar que el servicio tarde demasiado en responder.
+        # Few repeats so the service responds quickly.
         self._publish_plan_for_rviz(plan_result, n_times=3, period_s=0.2)
 
         response.success = True
@@ -972,14 +695,11 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
     def _on_plan_offset_test(self, request, response):
-        """Servicio de prueba hacia una pose cartesiana cercana.
-
-        Planifica desde la pose actual hacia una pose generada por TF + offset.
-        No ejecuta automáticamente.
-        """
+        """Straight-line Cartesian move to current_pose + (offset_test_d{x,y,z}).
+        Used for descend/lift. Plans only; does not execute."""
 
         self.get_logger().info("Servicio recibido: plan_offset_test")
-        # Al iniciar cualquier nuevo plan, descartamos planes anteriores.
+        # Drop any previous plan when starting a new one.
         self.pending_plan_result = None
 
         if not self._wait_for_joint_state(timeout_s=5.0):
@@ -1026,8 +746,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
     def _on_plan_home_right(self, request, response):
         self.get_logger().info("Servicio recibido: plan_home_right")
-        # Al iniciar cualquier nuevo plan, descartamos planes anteriores.
-        # Así evitamos tener que llamar execute_last_plan con data=false manualmente.
+        # Drop any previous plan when starting a new one.
         self.pending_plan_result = None
         if not self._wait_for_joint_state(timeout_s=5.0):
             response.success = False
@@ -1059,7 +778,7 @@ class UrDualCommandServices(UrDualMoveItPy):
         return response
 
     def _on_plan_ready_right(self, request, response):
-        """Planifica hacia la pose Ready_Right del brazo derecho."""
+        """Plan to the SRDF Ready_Right named pose."""
 
         self.get_logger().info("Servicio recibido: plan_ready_right")
 
@@ -1174,49 +893,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
 
-    def _update_obstacles_before_planning(self, timeout_s=5.0):
-            """
-            Llama al servicio obstacle_clusterer para refrescar los obstáculos
-            en el planning scene ANTES de cada planificación. Esto da una captura
-            'frozen' del mundo: las cajas de colisión generadas por percepción 3D
-            quedan fijas durante la planificación, sin race conditions.
-            """
-
-            if not self.update_obstacles_client.wait_for_service(timeout_sec=1.0):
-                self.get_logger().warn(
-                    "/ur_dual/update_obstacles no disponible; planifico SIN actualizar obstáculos."
-                )
-                return False
-
-            req = Trigger.Request()
-            future = self.update_obstacles_client.call_async(req)
-
-            start = time.monotonic()
-            while rclpy.ok() and not future.done():
-                if time.monotonic() - start > timeout_s:
-                    self.get_logger().warn("Timeout esperando /ur_dual/update_obstacles.")
-                    return False
-                time.sleep(0.05)
-
-            result = future.result()
-            if result is None:
-                self.get_logger().warn("update_obstacles devolvió None.")
-                return False
-
-            self.get_logger().info(f"update_obstacles: {result.message}")
-            # Delay corto para que el planning scene monitor procese el diff
-            # antes de que MoveIt empiece a planificar.
-            time.sleep(0.3)
-            return result.success
-
-
-
-
-
-
-
     def _call_oak_service(self, client, service_label, timeout_s=3.0):
-        """Helper para llamar a un servicio Trigger de la OAK con timeout."""
+        """Call an OAK Trigger service with a timeout."""
         if not client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error(
                 f"Servicio {service_label} no disponible (cámara no corriendo?)."
@@ -1244,12 +922,8 @@ class UrDualCommandServices(UrDualMoveItPy):
         return True
 
     def _on_freeze_octomap(self, request, response):
-        """
-        Congela el OctoMap deteniendo el pipeline de la OAK.
-        El OctoMap actual queda como snapshot durante la ejecución del
-        pick-and-place, evitando que el brazo, la mano o el cable de la
-        SoftHand sean incorporados como obstáculos espurios.
-        """
+        """Freeze the OctoMap by stopping the OAK pipeline, so the moving arm,
+        hand and cable are not added as spurious obstacles during execution."""
         if self._octomap_frozen:
             response.success = True
             response.message = "OctoMap ya estaba congelado."
@@ -1265,8 +939,7 @@ class UrDualCommandServices(UrDualMoveItPy):
             response.message = "No pude detener la cámara para congelar OctoMap."
             return response
 
-        # Pequeño delay para que el plugin DepthImageOctomapUpdater procese
-        # los últimos frames que ya tenía en cola antes de quedar sin datos.
+        # Small delay so the updater processes the last queued frames.
         time.sleep(0.5)
 
         self._octomap_frozen = True
@@ -1276,11 +949,8 @@ class UrDualCommandServices(UrDualMoveItPy):
         return response
 
     def _on_unfreeze_octomap(self, request, response):
-        """
-        Reanuda la captura del OctoMap rearrancando el pipeline de la OAK.
-        Se llama al final de la secuencia de pick-and-place, ya con el
-        brazo retornado a Ready_Right.
-        """
+        """Resume OctoMap capture by restarting the OAK pipeline. Called at the
+        end of the cycle, once the arm is back at Ready_Right."""
         if not self._octomap_frozen:
             response.success = True
             response.message = "OctoMap ya estaba activo."
@@ -1296,8 +966,7 @@ class UrDualCommandServices(UrDualMoveItPy):
             response.message = "No pude rearrancar la cámara para descongelar OctoMap."
             return response
 
-        # Tras start_camera la OAK tarda ~1-2s en estabilizar.
-        # No bloqueamos aquí; el siguiente ciclo continuará normalmente.
+        # The OAK takes ~1-2 s to stabilise after start; we do not block here.
         self._octomap_frozen = False
         response.success = True
         response.message = "OctoMap descongelado (cámara reiniciada)."
@@ -1310,13 +979,8 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
     def _get_softhand_touch_links(self):
-        """
-        Lista de links de la SoftHand que MoveIt debe permitir tocar
-        al attached object sin marcarlo como colisión.
-
-        Estos nombres vienen del URDF del qbhand2m1. Si en el futuro
-        cambia la SoftHand, hay que revisar y actualizar estos nombres.
-        """
+        """SoftHand links the attached object is allowed to touch without being
+        flagged as a collision (touch_links). Names come from the qbhand2m1 URDF."""
         return [
             "qbhand2m1_palm_link",
             "qbhand2m1_thumb_knuckle_link",
@@ -1341,13 +1005,8 @@ class UrDualCommandServices(UrDualMoveItPy):
         ]
 
     def _on_attach_grasped_object(self, request, response):
-        """
-        Agrega el objeto agarrado como AttachedCollisionObject al frame
-        de la mano. A partir de este punto, MoveIt considera la geometría
-        conjunta (mano + objeto) para todas las planificaciones, evitando
-        colisiones del objeto contra obstáculos del entorno durante
-        lift y place.
-        """
+        """Attach the grasped object as an AttachedCollisionObject on the hand
+        frame, so MoveIt checks hand+object against obstacles during lift/place."""
         if self._object_attached:
             response.success = True
             response.message = "El objeto ya estaba attached."
@@ -1367,7 +1026,7 @@ class UrDualCommandServices(UrDualMoveItPy):
             f"size=({sx:.3f},{sy:.3f},{sz:.3f}), offset=({ox:.3f},{oy:.3f},{oz:.3f})"
         )
 
-        # Construir CollisionObject base.
+        # Base CollisionObject (a box).
         collision = CollisionObject()
         collision.header.frame_id = frame
         collision.header.stamp = self.get_clock().now().to_msg()
@@ -1387,13 +1046,13 @@ class UrDualCommandServices(UrDualMoveItPy):
         collision.primitives.append(box)
         collision.primitive_poses.append(pose)
 
-        # Construir AttachedCollisionObject.
+        # Wrap it as an AttachedCollisionObject.
         attached = AttachedCollisionObject()
         attached.link_name = frame
         attached.object = collision
         attached.touch_links = self._get_softhand_touch_links()
 
-        # Publicar en planning_scene como diff.
+        # Publish to the planning scene as a diff.
         scene = PlanningScene()
         scene.is_diff = True
         scene.robot_state.is_diff = True
@@ -1401,7 +1060,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
         self.planning_scene_pub.publish(scene)
 
-        # Pequeño delay para que el PlanningSceneMonitor procese el diff.
+        # Small delay so the PlanningSceneMonitor processes the diff.
         time.sleep(0.3)
 
         self._object_attached = True
@@ -1411,11 +1070,8 @@ class UrDualCommandServices(UrDualMoveItPy):
         return response
 
     def _on_detach_grasped_object(self, request, response):
-        """
-        Quita el AttachedCollisionObject del frame de la mano.
-        Llamar JUSTO ANTES de abrir la mano en el place.
-        Después de detach, MoveIt no considera el objeto como parte del robot.
-        """
+        """Detach the object from the hand. Call right before opening the hand at
+        the place; afterwards MoveIt no longer treats it as part of the robot."""
         if not self._object_attached:
             response.success = True
             response.message = "No hay objeto attached para liberar."
@@ -1426,7 +1082,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
         self.get_logger().info(f"DETACH '{obj_id}' de '{frame}'.")
 
-        # CollisionObject con operation REMOVE.
+        # Detach via AttachedCollisionObject REMOVE.
         collision = CollisionObject()
         collision.id = obj_id
         collision.operation = CollisionObject.REMOVE
@@ -1443,7 +1099,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
         self.planning_scene_pub.publish(scene)
 
-        # También removerlo del mundo en caso de que quede ahí flotando.
+        # Also remove it from the world in case it remains floating.
         time.sleep(0.2)
         world_remove = CollisionObject()
         world_remove.id = obj_id
@@ -1470,21 +1126,10 @@ class UrDualCommandServices(UrDualMoveItPy):
         self._latest_object_class = msg.data
 
     def _on_clear_octomap_around_object(self, request, response):
-        """
-        Limpia el OctoMap dentro de una caja del tamaño aproximado del
-        objeto detectado, centrada en su pose. La caja se elige según
-        la clase YOLO del último objeto recibido (OBJECT_DIMENSIONS).
-
-        MoveIt procesa el CollisionObject REMOVE con geometría y borra
-        los voxels del OctoMap que caen dentro. El warning
-        'Tried to remove world object 'octomap_clear_region', but it
-        does not exist in this scene' es inofensivo: lo emite MoveIt
-        antes de procesar el efecto sobre el OctoMap, pero la limpieza
-        de voxels sí ocurre.
-
-        Llamar este servicio DESPUÉS de freeze_octomap para que los
-        voxels limpios no se repueblen mientras se planifica.
-        """
+        """Clear OctoMap voxels inside a box sized to the detected object's class
+        (OBJECT_DIMENSIONS) and centred on its pose. MoveIt removes the voxels that
+        fall inside; the 'object does not exist' warning it logs is harmless. Call
+        AFTER freeze_octomap so the cleared voxels are not repopulated."""
         if self.latest_object_pose is None:
             response.success = False
             response.message = "No hay pose de objeto disponible."
@@ -1513,8 +1158,7 @@ class UrDualCommandServices(UrDualMoveItPy):
             f"{pose.pose.position.z:.3f})"
         )
 
-        # CollisionObject tipo BOX con operation REMOVE. MoveIt limpia
-        # los voxels del octomap que caen dentro de esta caja.
+        # BOX CollisionObject with REMOVE op: MoveIt clears the voxels inside it.
         collision = CollisionObject()
         collision.header.frame_id = pose.header.frame_id
         collision.header.stamp = self.get_clock().now().to_msg()
@@ -1554,7 +1198,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
 
     def _on_clear_octomap(self, request, response):
-        """Limpia el OctoMap local del commander."""
+        """Clear this commander's local OctoMap."""
 
         self.get_logger().info("Servicio recibido: clear_octomap local del commander")
 
@@ -1582,8 +1226,7 @@ class UrDualCommandServices(UrDualMoveItPy):
 
         plan_to_execute = self.pending_plan_result
 
-        # Apenas se solicita ejecución, borramos el plan pendiente.
-        # Así no se reutiliza por accidente una trayectoria vieja.
+        # Clear the pending plan immediately so a stale trajectory is not reused.
         self.pending_plan_result = None
 
         self.get_logger().warn(
