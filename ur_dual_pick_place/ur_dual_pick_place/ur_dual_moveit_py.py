@@ -2,25 +2,17 @@
 # -----------------------------------------------------------------------------
 # ur_dual_moveit_py.py
 #
-# Wrapper principal de MoveItPy para el sistema UR5 dual + SoftHand.
+# MoveItPy wrapper for the dual UR5 + SoftHand system.
 #
-# Inspirado en la arquitectura de tiago_dual_moveit_py, pero reducido a lo que
-# necesitamos ahora:
-#   - Solo brazo derecho lógico: grupo MoveIt "Right_arm"
-#   - Planificación a named poses
-#   - Planificación a PoseStamped
-#   - Ejecución opcional
-#   - Métodos base para collision objects
-#
-# IMPORTANTE:
-# El nombre del nodo ROS2 y el node_name de MoveItPy deben coincidir.
-# Si no coinciden, los parámetros de motion_planning.yaml caen en otro namespace
-# y MoveItPy no carga bien los planning pipelines.
+# Scope (only the logical right arm is driven):
+#   - MoveIt group "Right_arm" (physically the ur_dual_I_* arm, holds the SoftHand)
+#   - OMPL planning to named poses and to Cartesian poses (best-of-N, cable-aware)
+#   - Real straight-line Cartesian planning via /compute_cartesian_path
+#   - OctoMap relay: mirrors move_group's OctoMap into this node's planning scene
 # -----------------------------------------------------------------------------
 
 import time
 import rclpy
-import threading
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
 
@@ -42,58 +34,60 @@ from moveit_msgs.msg import (
     OrientationConstraint,
 )
 
+# Degrees per radian, used only for human-readable joint-motion logs.
+RAD_TO_DEG = 57.2958
+
 
 class UrDualMoveItPy(Node):
-    """Wrapper base para controlar el UR5 dual desde MoveItPy."""
+    """Base wrapper to drive the dual UR5 from MoveItPy."""
 
     def __init__(self, name: str = "ur_dual_commander"):
         super().__init__(name)
 
-        self.get_logger().info("Inicializando UrDualMoveItPy...")
+        self.get_logger().info("Initializing UrDualMoveItPy...")
 
-        # MoveItPy debe usar el mismo nombre del nodo.
+        # MoveItPy must use the same node name (see header note).
         self.robot = MoveItPy(node_name=name)
 
-        # Modelo y planning scene monitor.
         self.robot_model = self.robot.get_robot_model()
         self.planning_monitor = self.robot.get_planning_scene_monitor()
 
-        # Configuración de ejecución, siguiendo el patrón de TIAGo.
+        # Trajectory execution settings (allow some duration slack and a small
+        # start tolerance so execution is not rejected by tiny state mismatches).
         try:
             trajectory_execution = self.robot.get_trajectory_execution_manager()
             trajectory_execution.enable_execution_duration_monitoring(True)
             trajectory_execution.set_allowed_execution_duration_scaling(1.2)
             trajectory_execution.set_allowed_start_tolerance(0.05)
-            self.get_logger().info("TrajectoryExecutionManager configurado.")
+            self.get_logger().info("TrajectoryExecutionManager configured.")
         except Exception as exc:
             self.get_logger().warn(
-                f"No se pudo configurar TrajectoryExecutionManager: {exc}"
+                f"Could not configure TrajectoryExecutionManager: {exc}"
             )
 
-        # Grupos MoveIt. Por ahora usamos solo Right_arm.
-        # En tu configuración, Right_arm corresponde físicamente al brazo con prefijo ur_dual_I_*.
+        # Only the right arm is used. "Right_arm" maps physically to the ur_dual_I_* arm.
         self.groups: Dict[str, PlanningComponent] = {
             "right": self.robot.get_planning_component("Right_arm"),
         }
 
-        # Link que se usará como TCP para goals cartesianos.
-        # Para la primera validación dejamos tool0 porque sabemos que está dentro del grupo.
-        # Luego probamos qbhand2m1_palm_link si queremos que el target sea la palma.
+        # Link used as the TCP for Cartesian goals. tool0 is inside the planning group.
         self.pose_links: Dict[str, str] = {
             "right": "ur_dual_I_tool0",
-            # Alternativa futura:
-            # "right": "qbhand2m1_palm_link",
         }
 
-        # Publisher para diffs de planning scene.
+        # Publisher for planning-scene diffs. Used by the commander's attach/detach
+        # services to push AttachedCollisionObjects to move_group on /planning_scene.
         self.planning_scene_pub = self.create_publisher(
             PlanningScene,
             "/planning_scene",
             10,
         )
 
-
-
+        # --- OctoMap relay ---
+        # This node's PlanningSceneMonitor has no 3D sensor of its own, so it never
+        # builds an OctoMap. move_group publishes its full scene (with the
+        # category-filtered OctoMap) on /monitored_planning_scene; we subscribe and
+        # re-inject only the OctoMap into the local scene so planning here respects it.
         self._octomap_synced_once = False
         self._octomap_sync_sub = self.create_subscription(
             PlanningScene,
@@ -102,22 +96,8 @@ class UrDualMoveItPy(Node):
             10,
         )
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-        # Callback group dedicado para clientes internos, siguiendo el patrón
-        # de tiago_dual_moveit_py. Esto evita bloqueos cuando un servicio
-        # nuestro llama a otro servicio de ROS2.
+        # Dedicated callback group for internal service clients, so a service of ours
+        # can call another ROS 2 service without deadlocking.
         self.cb_internal_client = MutuallyExclusiveCallbackGroup()
 
         self.cartesian_plan_client = self.create_client(
@@ -126,27 +106,24 @@ class UrDualMoveItPy(Node):
             callback_group=self.cb_internal_client,
         )
 
-        self.get_logger().info("UrDualMoveItPy listo.")
+        self.get_logger().info("UrDualMoveItPy ready.")
 
-    # -------------------------------------------------------------------------
-    # Helpers internos
-    # -------------------------------------------------------------------------
+    # Internal helpers
 
     def _get_arm(self, arm: str) -> PlanningComponent:
         if arm not in self.groups:
-            raise ValueError(f"Brazo inválido: {arm}. Opciones: {list(self.groups)}")
+            raise ValueError(f"Invalid arm: {arm}. Options: {list(self.groups)}")
         return self.groups[arm]
 
     def _get_pose_link(self, arm: str, pose_link: Optional[str] = None) -> str:
         return pose_link if pose_link is not None else self.pose_links[arm]
 
-    # -------------------------------------------------------------------------
-    # Planificación general
-    # -------------------------------------------------------------------------
+
+    # General planning / execution
 
     def plan(self, planning_component: PlanningComponent):
-        """Ejecuta planning_component.plan() y devuelve el resultado."""
-        self.get_logger().info("Planificando trayectoria...")
+        """Run planning_component.plan() and return the result."""
+        self.get_logger().info("Planning trajectory...")
         return planning_component.plan()
 
     def execute_trajectory(
@@ -156,12 +133,13 @@ class UrDualMoveItPy(Node):
         acceleration_scaling: float = 0.05,
         sleep_time: float = 0.0,
     ):
-        """Ejecuta una RobotTrajectory usando los controladores configurados."""
+        """Execute a RobotTrajectory through the configured controllers."""
 
         self.get_logger().warn(
-            "Ejecutando trayectoria. Mantén vigilancia y paro de emergencia listo."
+            "Executing trajectory. Stay alert and keep the e-stop ready."
         )
 
+        # Re-time the trajectory (TOTG). If it fails, execute it as-is.
         try:
             trajectory.apply_totg_time_parameterization(
                 velocity_scaling,
@@ -169,34 +147,35 @@ class UrDualMoveItPy(Node):
             )
         except Exception as exc:
             self.get_logger().warn(
-                f"No se pudo aplicar TOTG manualmente. Se ejecutará la trayectoria como viene: {exc}"
+                f"Could not apply TOTG manually; executing trajectory as-is: {exc}"
             )
 
         result = self.robot.execute(trajectory, controllers=[])
         time.sleep(sleep_time)
 
-        self.get_logger().info(f"Resultado de ejecución: {result}")
+        self.get_logger().info(f"Execution result: {result}")
         return result
 
 
+    # Cable-protection checks
+    #
+    # These do NOT replace MoveIt collision checking. They are an extra guard for
+    # the SoftHand cable: OMPL can return a valid but needlessly twisted path, so
+    # we reject/score trajectories by how much the joints rotate.
     def _trajectory_cable_motion_ok(
         self,
         trajectory: RobotTrajectory,
         max_delta_by_joint: Optional[Dict[str, float]] = None,
     ) -> bool:
-        """Revisa que ningún joint del brazo derecho gire demasiado.
-
-        Esto no reemplaza las colisiones de MoveIt. Es una protección extra
-        por el cable de la SoftHand, porque OMPL puede generar una trayectoria
-        válida pero con vueltas innecesarias.
-        """
+        """Reject the trajectory if any arm joint sweeps more than its limit (rad)."""
 
         if max_delta_by_joint is None:
+            # Per-joint hard limits (rad). The wrist joints are tighter because the
+            # SoftHand cable suffers most there.
             max_delta_by_joint = {
                 "ur_dual_I_shoulder_pan_joint": 3.80,
                 "ur_dual_I_shoulder_lift_joint": 3.40,
                 "ur_dual_I_elbow_joint": 3.40,
-
                 "ur_dual_I_wrist_1_joint": 1.70,
                 "ur_dual_I_wrist_2_joint": 1.55,
                 "ur_dual_I_wrist_3_joint": 0.75,
@@ -206,71 +185,55 @@ class UrDualMoveItPy(Node):
         joint_names = list(traj_msg.joint_trajectory.joint_names)
 
         if not traj_msg.joint_trajectory.points:
-            self.get_logger().error("Trayectoria sin puntos. Se rechaza por seguridad.")
+            self.get_logger().error("Empty trajectory. Rejected for safety.")
             return False
 
         ok = True
-
-        self.get_logger().info("Chequeo general de cable/joints:")
+        self.get_logger().info("Cable/joint sweep check:")
 
         for joint_name, max_delta_rad in max_delta_by_joint.items():
             if joint_name not in joint_names:
-                self.get_logger().warn(
-                    f"  {joint_name}: no aparece en la trayectoria."
-                )
+                self.get_logger().warn(f"  {joint_name}: not in trajectory.")
                 continue
 
             idx = joint_names.index(joint_name)
-
             positions = [
                 point.positions[idx]
                 for point in traj_msg.joint_trajectory.points
                 if len(point.positions) > idx
             ]
-
             if not positions:
-                self.get_logger().warn(
-                    f"  {joint_name}: sin posiciones en la trayectoria."
-                )
+                self.get_logger().warn(f"  {joint_name}: no positions in trajectory.")
                 continue
 
+            # Sweep = max - min over the whole trajectory for this joint.
             delta = max(positions) - min(positions)
-            delta_deg = delta * 57.2958
-            max_delta_deg = max_delta_rad * 57.2958
-
             self.get_logger().info(
                 f"  {joint_name}: delta={delta:.3f} rad "
-                f"({delta_deg:.1f} deg), límite={max_delta_rad:.3f} rad "
-                f"({max_delta_deg:.1f} deg)"
+                f"({delta * RAD_TO_DEG:.1f} deg), limit={max_delta_rad:.3f} rad "
+                f"({max_delta_rad * RAD_TO_DEG:.1f} deg)"
             )
 
             if abs(delta) > max_delta_rad:
                 ok = False
-                self.get_logger().error(
-                    f"  RECHAZADO: {joint_name} gira demasiado."
-                )
+                self.get_logger().error(f"  REJECTED: {joint_name} rotates too much.")
 
         if not ok:
-            self.get_logger().error(
-                "Trayectoria rechazada por protección de cable."
-            )
+            self.get_logger().error("Trajectory rejected by cable protection.")
 
         return ok
 
-
     def _trajectory_cable_cost(self, trajectory: RobotTrajectory) -> tuple[float, dict]:
-        """Calcula un costo de trayectoria según cuánto giran los joints.
+        """Weighted joint-sweep cost used to pick the gentlest of several valid plans.
 
-        Menor costo = trayectoria más amable con el cable.
-
-        Este costo NO decide colisiones. MoveIt ya valida colisiones antes.
-        Solo sirve para escoger entre varias trayectorias válidas.
+        Lower cost = friendlier to the cable. This does NOT decide collisions;
+        MoveIt has already validated them. It only ranks valid trajectories.
         """
 
         traj_msg = trajectory.get_robot_trajectory_msg()
         joint_names = list(traj_msg.joint_trajectory.joint_names)
 
-        # Pesos: muñeca pesa más porque el cable de la SoftHand sufre más ahí.
+        # Equal weights for now; kept as a dict so the wrist can be weighted higher later.
         weights = {
             "ur_dual_I_shoulder_pan_joint": 0.001,
             "ur_dual_I_shoulder_lift_joint": 0.001,
@@ -286,18 +249,14 @@ class UrDualMoveItPy(Node):
         for joint_name, weight in weights.items():
             if joint_name not in joint_names:
                 continue
-
             idx = joint_names.index(joint_name)
-
             positions = [
                 point.positions[idx]
                 for point in traj_msg.joint_trajectory.points
                 if len(point.positions) > idx
             ]
-
             if not positions:
                 continue
-
             delta = max(positions) - min(positions)
             deltas[joint_name] = delta
             cost += weight * abs(delta)
@@ -305,16 +264,16 @@ class UrDualMoveItPy(Node):
         return cost, deltas
 
     def _log_cable_deltas(self, deltas: dict, prefix: str = ""):
-        """Imprime deltas de joints de forma legible."""
-
+        """Pretty-print per-joint sweeps."""
         if prefix:
             self.get_logger().info(prefix)
-
         for joint_name, delta in deltas.items():
             self.get_logger().info(
-                f"  {joint_name}: delta={delta:.3f} rad "
-                f"({delta * 57.2958:.1f} deg)"
+                f"  {joint_name}: delta={delta:.3f} rad ({delta * RAD_TO_DEG:.1f} deg)"
             )
+
+
+    # OMPL planning to a Cartesian pose (best-of-N, cable-aware)
 
 
     def arm_plan_to_pose_raw(
@@ -325,21 +284,15 @@ class UrDualMoveItPy(Node):
         orientation_tolerance: Optional[tuple] = None,
         position_tolerance: float = 0.005,
     ):
-        """Planifica hacia una pose y devuelve el plan sin aplicar filtro de cable.
+        """Plan to a pose and return the raw plan (no cable filter applied).
 
-        Se usa para generar candidatos. Luego otro método escoge el mejor.
+        Used to generate candidates that a caller then ranks.
 
-        Si orientation_tolerance es None, planifica hacia la pose exacta
-        con la tolerancia default de MoveIt (comportamiento original).
-
-        Si orientation_tolerance es (tol_roll, tol_pitch, tol_yaw) en
-        radianes, construye un goal con:
-          - PositionConstraint: esfera de radio position_tolerance
-            alrededor del target XYZ.
-          - OrientationConstraint: tolerancias por eje en torno a la
-            orientación de referencia.
-        Esto permite que OMPL explore muchas más soluciones IK,
-        especialmente cuando se libera el yaw (eje vertical del agarre).
+        If orientation_tolerance is None, plan to the exact pose with MoveIt's
+        default tolerance. If it is (tol_roll, tol_pitch, tol_yaw) in radians,
+        build a goal from a tight PositionConstraint (sphere of radius
+        position_tolerance) plus a per-axis OrientationConstraint. Relaxing the
+        orientation (especially yaw) lets OMPL explore many more IK solutions.
         """
 
         selected_arm = self._get_arm(arm)
@@ -348,14 +301,11 @@ class UrDualMoveItPy(Node):
         selected_arm.set_start_state_to_current_state()
 
         if orientation_tolerance is None:
-            # Comportamiento original: pose exacta.
-            selected_arm.set_goal_state(
-                pose_stamped_msg=pose,
-                pose_link=link,
-            )
-            mode_msg = "pose exacta"
+            # Exact pose goal.
+            selected_arm.set_goal_state(pose_stamped_msg=pose, pose_link=link)
+            mode_msg = "exact pose"
         else:
-            # Goal con constraints (posición tight + orientación tolerante).
+            # Goal with constraints (tight position + tolerant orientation).
             constraints = self._build_pose_constraints(
                 pose=pose,
                 link=link,
@@ -370,17 +320,14 @@ class UrDualMoveItPy(Node):
             )
 
         self.get_logger().info(
-            f"Plan candidato hacia pose usando pose_link='{link}' "
+            f"Candidate plan to pose using pose_link='{link}' "
             f"frame='{pose.header.frame_id}' [{mode_msg}]"
         )
 
         plan_result = selected_arm.plan()
-
         if not plan_result:
             return None
-
         return plan_result
-
 
     def _build_pose_constraints(
         self,
@@ -389,19 +336,15 @@ class UrDualMoveItPy(Node):
         position_tolerance: float,
         orientation_tolerance: tuple,
     ) -> Constraints:
-        """
-        Construye un mensaje Constraints con:
-          - PositionConstraint: target XYZ con esfera de tolerancia.
-          - OrientationConstraint: orientación de referencia con
-            tolerancias por eje (XYZ Euler).
+        """Build a Constraints goal: a position sphere + per-axis orientation tolerance.
 
-        Esto es lo que OMPL usa como goal cuando le pasamos
-        motion_plan_constraints en lugar de pose_stamped_msg.
+        This is what OMPL receives when we pass motion_plan_constraints instead of a
+        plain pose goal.
         """
         constraints = Constraints()
         constraints.name = "pregrasp_target_with_tol"
 
-        # ---- PositionConstraint ----
+        # PositionConstraint: a sphere of radius position_tolerance around the target.
         pos_c = PositionConstraint()
         pos_c.header = pose.header
         pos_c.link_name = link
@@ -409,7 +352,6 @@ class UrDualMoveItPy(Node):
         pos_c.target_point_offset.y = 0.0
         pos_c.target_point_offset.z = 0.0
 
-        # Región tipo esfera centrada en el target.
         sphere = SolidPrimitive()
         sphere.type = SolidPrimitive.SPHERE
         sphere.dimensions = [position_tolerance]
@@ -421,12 +363,10 @@ class UrDualMoveItPy(Node):
         region_pose.orientation.w = 1.0
         pos_c.constraint_region.primitive_poses.append(region_pose)
         pos_c.weight = 1.0
-
         constraints.position_constraints.append(pos_c)
 
-        # ---- OrientationConstraint ----
+        # OrientationConstraint: reference orientation with per-axis (XYZ-Euler) tolerance.
         tol_roll, tol_pitch, tol_yaw = orientation_tolerance
-
         ori_c = OrientationConstraint()
         ori_c.header = pose.header
         ori_c.link_name = link
@@ -436,11 +376,9 @@ class UrDualMoveItPy(Node):
         ori_c.absolute_z_axis_tolerance = float(tol_yaw)
         ori_c.parameterization = OrientationConstraint.XYZ_EULER_ANGLES
         ori_c.weight = 1.0
-
         constraints.orientation_constraints.append(ori_c)
 
         return constraints
-
 
     def arm_go_to_pose_best_of_n(
         self,
@@ -454,18 +392,22 @@ class UrDualMoveItPy(Node):
         orientation_tolerance: Optional[tuple] = None,
         position_tolerance: float = 0.005,
     ):
-        """Genera varios planes OMPL y escoge el mejor según costo de cable."""
+        """Generate several OMPL plans and keep the one with the lowest cable cost.
+
+        Returns (success, status, plan). On success the chosen plan still has to pass
+        the hard cable-sweep limits before it is accepted.
+        """
 
         best_plan = None
         best_cost = None
         best_deltas = None
 
         self.get_logger().info(
-            f"Iniciando best-of-{attempts} para pre-grasp con protección de cable."
+            f"Starting best-of-{attempts} pre-grasp with cable protection."
         )
 
         for i in range(attempts):
-            self.get_logger().info(f"Intento OMPL candidato {i + 1}/{attempts}")
+            self.get_logger().info(f"OMPL candidate {i + 1}/{attempts}")
 
             plan_result = self.arm_plan_to_pose_raw(
                 arm=arm,
@@ -474,16 +416,12 @@ class UrDualMoveItPy(Node):
                 orientation_tolerance=orientation_tolerance,
                 position_tolerance=position_tolerance,
             )
-
             if plan_result is None:
-                self.get_logger().warn(f"  Intento {i + 1}: PLAN_FAILED")
+                self.get_logger().warn(f"  Attempt {i + 1}: PLAN_FAILED")
                 continue
 
             cost, deltas = self._trajectory_cable_cost(plan_result.trajectory)
-
-            self.get_logger().info(
-                f"  Intento {i + 1}: costo cable={cost:.3f}"
-            )
+            self.get_logger().info(f"  Attempt {i + 1}: cable cost={cost:.3f}")
             self._log_cable_deltas(deltas)
 
             if best_plan is None or cost < best_cost:
@@ -492,24 +430,18 @@ class UrDualMoveItPy(Node):
                 best_deltas = deltas
 
         if best_plan is None:
-            self.get_logger().error(
-                "Ningún intento OMPL produjo trayectoria válida."
-            )
+            self.get_logger().error("No OMPL attempt produced a valid trajectory.")
             return False, "PLAN_FAILED", None
 
-        self.get_logger().info(
-            f"Mejor plan seleccionado con costo cable={best_cost:.3f}"
-        )
-        self._log_cable_deltas(best_deltas, prefix="Deltas del mejor plan:")
+        self.get_logger().info(f"Best plan selected with cable cost={best_cost:.3f}")
+        self._log_cable_deltas(best_deltas, prefix="Best-plan deltas:")
 
-        # Ahora sí aplicamos límites duros.
+        # Apply the hard cable limits to the chosen plan.
         if not self._trajectory_cable_motion_ok(best_plan.trajectory):
-            self.get_logger().error(
-                "El mejor plan encontrado sigue siendo riesgoso para el cable."
-            )
+            self.get_logger().error("Best plan still too risky for the cable.")
             return False, "CABLE_MOTION_TOO_LARGE", best_plan
 
-        self.get_logger().info("PLAN BEST-OF-N OK ✓")
+        self.get_logger().info("BEST-OF-N PLAN OK")
 
         if execute:
             exec_result = self.execute_trajectory(
@@ -521,7 +453,6 @@ class UrDualMoveItPy(Node):
 
         return True, "BEST_OF_N_PLAN_SUCCEEDED", best_plan
 
-
     def plan_and_maybe_execute(
         self,
         planning_component: PlanningComponent,
@@ -529,24 +460,22 @@ class UrDualMoveItPy(Node):
         velocity_scaling: float = 0.05,
         acceleration_scaling: float = 0.05,
     ):
-        """Planifica y, si execute=True, ejecuta."""
+        """Plan and, if execute=True, run it. Applies the cable-sweep check first."""
 
         plan_result = self.plan(planning_component)
 
         if not plan_result:
             self.get_logger().error(
-                "PLAN FALLÓ. Puede ser por colisión, goal inalcanzable o timeout."
+                "PLAN FAILED. Collision, unreachable goal, or timeout."
             )
             return False, "PLAN_FAILED", None
 
-        self.get_logger().info(
-            "PLAN OK ✓. La trayectoria fue validada por el pipeline de MoveIt."
-        )
+        self.get_logger().info("PLAN OK. Trajectory validated by the MoveIt pipeline.")
 
         if not self._trajectory_cable_motion_ok(plan_result.trajectory):
             self.get_logger().error(
-                "PLAN RECHAZADO: aunque MoveIt encontró trayectoria, "
-                "el movimiento articular es riesgoso para el cable."
+                "PLAN REJECTED: MoveIt found a trajectory but the joint motion is "
+                "risky for the cable."
             )
             return False, "CABLE_MOTION_TOO_LARGE", plan_result
 
@@ -560,9 +489,9 @@ class UrDualMoveItPy(Node):
 
         return True, "PLAN_SUCCEEDED", plan_result
 
-    # -------------------------------------------------------------------------
-    # Movimientos de brazo
-    # -------------------------------------------------------------------------
+
+    # Arm moves
+
 
     def arm_go_to_named_pose(
         self,
@@ -572,15 +501,14 @@ class UrDualMoveItPy(Node):
         velocity_scaling: float = 0.05,
         acceleration_scaling: float = 0.05,
     ):
-        """Planifica o ejecuta hacia una pose nombrada del SRDF."""
+        """Plan/execute to an SRDF named pose (e.g. Ready_Right, Place_Normal_Right)."""
 
         selected_arm = self._get_arm(arm)
-
         selected_arm.set_start_state_to_current_state()
         selected_arm.set_goal_state(configuration_name=pose_name)
 
         self.get_logger().info(
-            f"Brazo '{arm}' → named pose '{pose_name}' | execute={execute}"
+            f"Arm '{arm}' -> named pose '{pose_name}' | execute={execute}"
         )
 
         return self.plan_and_maybe_execute(
@@ -590,222 +518,57 @@ class UrDualMoveItPy(Node):
             acceleration_scaling=acceleration_scaling,
         )
 
-    def arm_go_to_pose(
-        self,
-        arm: str,
-        pose: PoseStamped,
-        pose_link: Optional[str] = None,
-        execute: bool = False,
-        velocity_scaling: float = 0.05,
-        acceleration_scaling: float = 0.05,
-    ):
-        """Planifica o ejecuta hacia una PoseStamped."""
 
-        selected_arm = self._get_arm(arm)
-        link = self._get_pose_link(arm, pose_link)
-
-        selected_arm.set_start_state_to_current_state()
-        selected_arm.set_goal_state(
-            pose_stamped_msg=pose,
-            pose_link=link,
-        )
-
-        self.get_logger().info(
-            f"Brazo '{arm}' → pose cartesiana usando pose_link='{link}' | "
-            f"frame='{pose.header.frame_id}' | execute={execute}"
-        )
-
-        return self.plan_and_maybe_execute(
-            selected_arm,
-            execute=execute,
-            velocity_scaling=velocity_scaling,
-            acceleration_scaling=acceleration_scaling,
-        )
-
-    # -------------------------------------------------------------------------
-    # Collision objects
-    # -------------------------------------------------------------------------
-
-    def add_collision_box(
-        self,
-        object_id: str,
-        frame_id: str,
-        position: Tuple[float, float, float],
-        dimensions: Tuple[float, float, float],
-        orientation: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
-        color: Optional[Tuple[float, float, float, float]] = None,
-    ) -> bool:
-        """Agrega una caja a la planning scene."""
-
-        collision_object = CollisionObject()
-        collision_object.header.frame_id = frame_id
-        collision_object.header.stamp = self.get_clock().now().to_msg()
-        collision_object.id = object_id
-
-        box = SolidPrimitive()
-        box.type = SolidPrimitive.BOX
-        box.dimensions = [dimensions[0], dimensions[1], dimensions[2]]
-
-        pose = Pose()
-        pose.position.x = position[0]
-        pose.position.y = position[1]
-        pose.position.z = position[2]
-        pose.orientation.x = orientation[0]
-        pose.orientation.y = orientation[1]
-        pose.orientation.z = orientation[2]
-        pose.orientation.w = orientation[3]
-
-        collision_object.primitives.append(box)
-        collision_object.primitive_poses.append(pose)
-        collision_object.operation = CollisionObject.ADD
-
-        with self.planning_monitor.read_write() as scene:
-            if color is not None:
-                object_color = ObjectColor()
-                object_color.id = object_id
-                object_color.color.r = color[0]
-                object_color.color.g = color[1]
-                object_color.color.b = color[2]
-                object_color.color.a = color[3]
-                scene.apply_collision_object(collision_object, object_color)
-            else:
-                scene.apply_collision_object(collision_object)
-
-            scene.current_state.update()
-
-        self._publish_collision_diff(collision_object)
-
-        self.get_logger().info(
-            f"Collision box '{object_id}' agregada en frame '{frame_id}'."
-        )
-        return True
-
-    def add_collision_cylinder(
-        self,
-        object_id: str,
-        frame_id: str,
-        position: Tuple[float, float, float],
-        height: float,
-        radius: float,
-        orientation: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
-    ) -> bool:
-        """Agrega un cilindro a la planning scene."""
-
-        collision_object = CollisionObject()
-        collision_object.header.frame_id = frame_id
-        collision_object.header.stamp = self.get_clock().now().to_msg()
-        collision_object.id = object_id
-
-        cylinder = SolidPrimitive()
-        cylinder.type = SolidPrimitive.CYLINDER
-        cylinder.dimensions = [height, radius]
-
-        pose = Pose()
-        pose.position.x = position[0]
-        pose.position.y = position[1]
-        pose.position.z = position[2]
-        pose.orientation.x = orientation[0]
-        pose.orientation.y = orientation[1]
-        pose.orientation.z = orientation[2]
-        pose.orientation.w = orientation[3]
-
-        collision_object.primitives.append(cylinder)
-        collision_object.primitive_poses.append(pose)
-        collision_object.operation = CollisionObject.ADD
-
-        with self.planning_monitor.read_write() as scene:
-            scene.apply_collision_object(collision_object)
-            scene.current_state.update()
-
-        self._publish_collision_diff(collision_object)
-
-        self.get_logger().info(
-            f"Collision cylinder '{object_id}' agregado en frame '{frame_id}'."
-        )
-        return True
-
-    def remove_collision_object(self, object_id: str) -> bool:
-        """Remueve un objeto de colisión por ID."""
-
-        collision_object = CollisionObject()
-        collision_object.id = object_id
-        collision_object.operation = CollisionObject.REMOVE
-
-        with self.planning_monitor.read_write() as scene:
-            scene.apply_collision_object(collision_object)
-            scene.current_state.update()
-
-        self._publish_collision_diff(collision_object)
-
-        self.get_logger().info(f"Collision object '{object_id}' removido.")
-        return True
-
-    def _publish_collision_diff(self, collision_object: CollisionObject):
-        """Publica un diff de planning scene."""
-
-        msg = PlanningScene()
-        msg.world.collision_objects.append(collision_object)
-        msg.is_diff = True
-        self.planning_scene_pub.publish(msg)
-
-
-
+    # OctoMap relay
 
 
     def _on_move_group_scene(self, msg: PlanningScene):
-        """Relaya SOLO el OctoMap de move_group al PSM local como diff."""
+        """Relay ONLY the OctoMap from move_group into the local planning scene as a diff."""
         octo = msg.world.octomap.octomap
 
-        # Ignorar mensajes sin octomap (incluidos los vacíos que el propio
-        # commander publica en este mismo topic). Esto evita pisar el mapa.
+        # Skip messages without an OctoMap (including the empty scenes this node itself
+        # publishes on the same topic). This prevents wiping the map we already hold.
         if octo.resolution <= 0.0 or len(octo.data) == 0:
             return
 
         diff = PlanningScene()
         diff.is_diff = True
-        diff.world.octomap = msg.world.octomap  # solo el octomap, nada más
+        diff.world.octomap = msg.world.octomap  # only the octomap, nothing else
 
         try:
             self.planning_monitor.new_planning_scene_message(diff)
         except Exception as exc:
-            self.get_logger().warn(f"No se pudo aplicar OctoMap de move_group: {exc}")
+            self.get_logger().warn(f"Could not apply move_group OctoMap: {exc}")
             return
 
         if not self._octomap_synced_once:
             self._octomap_synced_once = True
             self.get_logger().info(
-                f"OctoMap de move_group sincronizado en el PSM local "
+                f"move_group OctoMap synced into local PSM "
                 f"(resolution={octo.resolution:.3f}, bytes={len(octo.data)})."
             )
 
-
-
-
-
     def clear_local_octomap(self) -> tuple[bool, str]:
-        """Intenta limpiar el OctoMap mantenido por este nodo MoveItPy.
+        """Clear the OctoMap held by THIS MoveItPy node's PlanningSceneMonitor.
 
-        Importante:
-        /clear_octomap normalmente limpia el OctoMap de move_group.
-        Como este proyecto usa MoveItPy en /ur_dual_commander, necesitamos
-        limpiar el mapa local del PlanningSceneMonitor del commander.
+        /clear_octomap clears move_group's map; this project plans from the
+        commander's local PSM, so we must clear that one. The Python binding name
+        varies, so we probe a couple of candidates on the monitor and on the scene.
         """
 
-        # Opción 1: método expuesto directamente en PlanningSceneMonitor.
+        # Option 1: method exposed on the PlanningSceneMonitor.
         for method_name in ("clear_octomap", "clearOctomap"):
             if hasattr(self.planning_monitor, method_name):
                 try:
                     getattr(self.planning_monitor, method_name)()
                     self.get_logger().info(
-                        f"OctoMap local limpiado usando planning_monitor.{method_name}()."
+                        f"Local OctoMap cleared via planning_monitor.{method_name}()."
                     )
-                    return True, f"OctoMap local limpiado con {method_name}()."
+                    return True, f"Local OctoMap cleared with {method_name}()."
                 except Exception as exc:
-                    self.get_logger().warn(
-                        f"Falló planning_monitor.{method_name}(): {exc}"
-                    )
+                    self.get_logger().warn(f"planning_monitor.{method_name}() failed: {exc}")
 
-        # Opción 2: algunos bindings podrían exponerlo desde la escena.
+        # Option 2: some bindings expose it on the scene object instead.
         try:
             with self.planning_monitor.read_write() as scene:
                 for method_name in ("clear_octomap", "clearOctomap"):
@@ -814,33 +577,26 @@ class UrDualMoveItPy(Node):
                             getattr(scene, method_name)()
                             scene.current_state.update()
                             self.get_logger().info(
-                                f"OctoMap local limpiado usando scene.{method_name}()."
+                                f"Local OctoMap cleared via scene.{method_name}()."
                             )
-                            return True, f"OctoMap local limpiado con scene.{method_name}()."
+                            return True, f"Local OctoMap cleared with scene.{method_name}()."
                         except Exception as exc:
-                            self.get_logger().warn(
-                                f"Falló scene.{method_name}(): {exc}"
-                            )
+                            self.get_logger().warn(f"scene.{method_name}() failed: {exc}")
         except Exception as exc:
             self.get_logger().warn(
-                f"No se pudo abrir planning_monitor.read_write() para limpiar OctoMap: {exc}"
+                f"Could not open planning_monitor.read_write() to clear OctoMap: {exc}"
             )
 
         msg = (
-            "No encontré un método Python expuesto para limpiar el OctoMap local. "
-            "Como fallback, reinicia ur_dual_command.launch.py para limpiar el mapa del commander."
+            "No exposed Python method found to clear the local OctoMap. "
+            "As a fallback, restart ur_dual_command.launch.py to reset the map."
         )
         self.get_logger().error(msg)
         return False, msg
 
 
+    # Real Cartesian planning (/compute_cartesian_path)
 
-
-
-
-    # -------------------------------------------------------------------------
-    # Planificación cartesiana real
-    # -------------------------------------------------------------------------
 
     def _trajectory_joint_delta_ok(
         self,
@@ -848,10 +604,9 @@ class UrDualMoveItPy(Node):
         joint_name: str = "ur_dual_I_wrist_3_joint",
         max_delta_rad: float = 0.35,
     ) -> bool:
-        """Revisa que un joint no gire demasiado dentro de la trayectoria.
+        """Reject a trajectory if a single joint sweeps too much (cable guard).
 
-        Esto es una protección práctica por el cable de la SoftHand.
-        0.35 rad equivale aproximadamente a 20 grados.
+        Default 0.35 rad (~20 deg) on wrist_3.
         """
 
         traj_msg = trajectory.get_robot_trajectory_msg()
@@ -859,36 +614,31 @@ class UrDualMoveItPy(Node):
 
         if joint_name not in joint_names:
             self.get_logger().warn(
-                f"No encontré {joint_name} en la trayectoria. "
-                "No puedo validar giro de muñeca."
+                f"{joint_name} not in trajectory; cannot check wrist sweep."
             )
             return True
 
         idx = joint_names.index(joint_name)
-
         positions = [
             point.positions[idx]
             for point in traj_msg.joint_trajectory.points
             if len(point.positions) > idx
         ]
-
         if not positions:
             self.get_logger().warn(
-                f"No hay posiciones para {joint_name}. "
-                "No puedo validar giro de muñeca."
+                f"No positions for {joint_name}; cannot check wrist sweep."
             )
             return True
 
         delta = max(positions) - min(positions)
-
         self.get_logger().info(
-            f"Chequeo cable/muñeca: {joint_name} delta={delta:.3f} rad "
-            f"({delta * 57.2958:.1f} deg)"
+            f"Cable/wrist check: {joint_name} delta={delta:.3f} rad "
+            f"({delta * RAD_TO_DEG:.1f} deg)"
         )
 
         if abs(delta) > max_delta_rad:
             self.get_logger().error(
-                f"Trayectoria rechazada: {joint_name} gira demasiado "
+                f"Trajectory rejected: {joint_name} rotates too much "
                 f"({delta:.3f} rad > {max_delta_rad:.3f} rad)."
             )
             return False
@@ -906,15 +656,10 @@ class UrDualMoveItPy(Node):
         timeout_s: float = 10.0,
         check_wrist: bool = True,
     ):
-        """Planifica una trayectoria cartesiana real hacia una pose.
+        """Plan a real straight-line Cartesian path to a single pose.
 
-        Diferencia clave:
-        - arm_go_to_pose() usa OMPL hacia un pose goal.
-        - cartesian_plan_to_pose() usa /compute_cartesian_path y waypoints.
-
-        Esto se debe usar para descensos/subidas cortas:
-        pre-grasp -> grasp
-        grasp -> lift
+        Unlike arm_go_to_pose_best_of_n (OMPL), this uses /compute_cartesian_path.
+        Use it for short descents/lifts (pre-grasp -> grasp, grasp -> lift).
         """
 
         selected_arm = self._get_arm(arm)
@@ -922,39 +667,34 @@ class UrDualMoveItPy(Node):
         link = self._get_pose_link(arm, pose_link)
 
         self.get_logger().info(
-            f"Plan cartesiano real: group='{group_name}', link='{link}', "
+            f"Cartesian plan: group='{group_name}', link='{link}', "
             f"frame='{pose.header.frame_id}', max_step={max_step}, "
             f"min_fraction={min_fraction}"
         )
 
-        self.get_logger().info(
-            "Esperando disponibilidad real de /compute_cartesian_path..."
-        )
-
+        # Wait for the service. It may show in the graph but not be matched yet
+        # (e.g. a stale endpoint after a move_group restart), so we retry and log.
+        self.get_logger().info("Waiting for /compute_cartesian_path to be available...")
         service_ready = False
-
         for attempt in range(1, 16):
             if self.cartesian_plan_client.wait_for_service(timeout_sec=1.0):
                 service_ready = True
                 break
-
             visible_services = [
                 name
                 for name, _types in self.get_service_names_and_types()
                 if "compute_cartesian" in name
             ]
-
             self.get_logger().warn(
-                f"/compute_cartesian_path aún no disponible para este nodo "
-                f"(intento {attempt}/15). Servicios visibles relacionados: "
-                f"{visible_services}"
+                f"/compute_cartesian_path not available yet for this node "
+                f"(attempt {attempt}/15). Related visible services: {visible_services}"
             )
 
         if not service_ready:
             self.get_logger().error(
-                "El cliente interno no logró conectarse a /compute_cartesian_path. "
-                "Si 'ros2 service list' lo muestra, puede ser discovery/daemon o que "
-                "el proveedor real del servicio no esté activo para este nodo."
+                "Internal client could not connect to /compute_cartesian_path. "
+                "If 'ros2 service list' shows it, it is likely discovery/daemon or a "
+                "dead provider endpoint."
             )
             return False, "CARTESIAN_SERVICE_NOT_AVAILABLE", None
 
@@ -974,42 +714,37 @@ class UrDualMoveItPy(Node):
             assert isinstance(current_state, RobotState)
             current_state.update(True)
 
-            # El start_state ya define desde dónde inicia la trayectoria.
-            # NO agregamos la pose actual como waypoint porque puede venir
-            # expresada en otro frame y provocar fraction=0.000.
+            # start_state defines where the trajectory begins. We do NOT add the
+            # current pose as a waypoint: it may be expressed in another frame and
+            # cause fraction=0.000.
             request.start_state = robotStateToRobotStateMsg(current_state)
 
-            # Solo pasamos el objetivo cartesiano.
-            # El frame de este waypoint es request.header.frame_id.
+            # Only the target waypoint; its frame is request.header.frame_id.
             request.waypoints = [pose.pose]
 
         future = self.cartesian_plan_client.call_async(request)
 
         start_time = time.monotonic()
-
         while rclpy.ok() and not future.done():
             if time.monotonic() - start_time > timeout_s:
                 self.get_logger().error(
-                    f"Timeout esperando respuesta de /compute_cartesian_path "
-                    f"({timeout_s}s)."
+                    f"Timeout waiting for /compute_cartesian_path ({timeout_s}s)."
                 )
                 return False, "CARTESIAN_TIMEOUT", None
-
             time.sleep(0.05)
 
         response = future.result()
-
         if response is None:
-            self.get_logger().error("Respuesta vacía de /compute_cartesian_path.")
+            self.get_logger().error("Empty response from /compute_cartesian_path.")
             return False, "CARTESIAN_EMPTY_RESPONSE", None
 
-        self.get_logger().info(
-            f"Cartesian fraction={response.fraction:.3f}"
-        )
+        self.get_logger().info(f"Cartesian fraction={response.fraction:.3f}")
 
+        # fraction = portion of the straight path that was solved. Below the
+        # threshold means it was blocked (residual voxels, joint limit, singularity).
         if response.fraction < min_fraction:
             self.get_logger().error(
-                f"Trayectoria cartesiana incompleta: fraction={response.fraction:.3f} "
+                f"Incomplete Cartesian path: fraction={response.fraction:.3f} "
                 f"< min_fraction={min_fraction:.3f}."
             )
             return False, "CARTESIAN_FRACTION_TOO_LOW", None
@@ -1027,165 +762,8 @@ class UrDualMoveItPy(Node):
                 return False, "WRIST_ROTATION_TOO_LARGE", None
 
         plan_like_result = SimpleNamespace(trajectory=robot_trajectory)
-
-        self.get_logger().info("PLAN CARTESIANO OK ✓")
+        self.get_logger().info("CARTESIAN PLAN OK")
         return True, "CARTESIAN_PLAN_SUCCEEDED", plan_like_result
-
-
-    def cartesian_plan_through_poses(
-        self,
-        arm: str,
-        poses: list[PoseStamped],
-        pose_link: Optional[str] = None,
-        max_step: float = 0.005,
-        jump_threshold: float = 0.0,
-        min_fraction: float = 0.95,
-        timeout_s: float = 15.0,
-        check_cable: bool = True,
-        start_joint_state_msg: Optional[JointState] = None,
-    ):
-        """Planifica una trayectoria cartesiana real pasando por varios waypoints.
-
-        Esto sirve para:
-        - mover primero en X/Y a una altura segura
-        - luego bajar en Z hacia pre-grasp
-        - evitar piruetas de muñeca típicas de OMPL
-        """
-
-        if not poses:
-            self.get_logger().error("No se recibieron waypoints cartesianos.")
-            return False, "NO_CARTESIAN_WAYPOINTS", None
-
-        selected_arm = self._get_arm(arm)
-        group_name = selected_arm.planning_group_name
-        link = self._get_pose_link(arm, pose_link)
-
-        frame_id = poses[0].header.frame_id
-
-        for idx, pose in enumerate(poses):
-            if pose.header.frame_id != frame_id:
-                self.get_logger().error(
-                    f"Waypoint {idx} tiene frame '{pose.header.frame_id}', "
-                    f"pero se esperaba '{frame_id}'."
-                )
-                return False, "WAYPOINT_FRAME_MISMATCH", None
-
-        self.get_logger().info(
-            f"Plan cartesiano por waypoints: group='{group_name}', "
-            f"link='{link}', frame='{frame_id}', "
-            f"waypoints={len(poses)}, max_step={max_step}, "
-            f"min_fraction={min_fraction}"
-        )
-
-        self.get_logger().info(
-            "Esperando disponibilidad real de /compute_cartesian_path..."
-        )
-
-        service_ready = False
-
-        for attempt in range(1, 16):
-            if self.cartesian_plan_client.wait_for_service(timeout_sec=1.0):
-                service_ready = True
-                break
-
-            visible_services = [
-                name
-                for name, _types in self.get_service_names_and_types()
-                if "compute_cartesian" in name
-            ]
-
-            self.get_logger().warn(
-                f"/compute_cartesian_path aún no disponible para este nodo "
-                f"(intento {attempt}/15). Servicios visibles relacionados: "
-                f"{visible_services}"
-            )
-
-        if not service_ready:
-            self.get_logger().error(
-                "El cliente interno no logró conectarse a /compute_cartesian_path."
-            )
-            return False, "CARTESIAN_SERVICE_NOT_AVAILABLE", None
-
-        request = GetCartesianPath.Request()
-        request.header.stamp = self.get_clock().now().to_msg()
-        request.header.frame_id = frame_id
-        request.group_name = group_name
-        request.link_name = link
-        request.max_step = max_step
-        request.jump_threshold = jump_threshold
-        request.avoid_collisions = True
-        request.max_velocity_scaling_factor = 0.05
-        request.max_acceleration_scaling_factor = 0.05
-
-        with self.planning_monitor.read_write() as scene:
-            current_state = scene.current_state
-            assert isinstance(current_state, RobotState)
-            current_state.update(True)
-
-            if start_joint_state_msg is not None:
-                start_state_msg = RobotStateMsg()
-                start_state_msg.joint_state = start_joint_state_msg
-                start_state_msg.is_diff = False
-                request.start_state = start_state_msg
-
-                self.get_logger().info(
-                    "Usando /joint_states real como start_state para Cartesian Path."
-                )
-            else:
-                request.start_state = robotStateToRobotStateMsg(current_state)
-
-                self.get_logger().warn(
-                    "Usando scene.current_state como start_state. "
-                    "Si el robot fue movido manualmente, esto puede estar desfasado."
-                )
-
-            request.waypoints = [pose.pose for pose in poses]
-
-        future = self.cartesian_plan_client.call_async(request)
-
-        start_time = time.monotonic()
-
-        while rclpy.ok() and not future.done():
-            if time.monotonic() - start_time > timeout_s:
-                self.get_logger().error(
-                    f"Timeout esperando respuesta de /compute_cartesian_path "
-                    f"({timeout_s}s)."
-                )
-                return False, "CARTESIAN_TIMEOUT", None
-
-            time.sleep(0.05)
-
-        response = future.result()
-
-        if response is None:
-            self.get_logger().error("Respuesta vacía de /compute_cartesian_path.")
-            return False, "CARTESIAN_EMPTY_RESPONSE", None
-
-        self.get_logger().info(f"Cartesian fraction={response.fraction:.3f}")
-
-        if response.fraction < min_fraction:
-            self.get_logger().error(
-                f"Trayectoria cartesiana incompleta: fraction={response.fraction:.3f} "
-                f"< min_fraction={min_fraction:.3f}."
-            )
-            return False, "CARTESIAN_FRACTION_TOO_LOW", None
-
-        robot_trajectory = RobotTrajectory(self.robot_model)
-        robot_trajectory.set_robot_trajectory_msg(current_state, response.solution)
-        robot_trajectory.joint_model_group_name = group_name
-
-        if check_cable:
-            if not self._trajectory_cable_motion_ok(robot_trajectory):
-                return False, "CABLE_MOTION_TOO_LARGE", SimpleNamespace(
-                    trajectory=robot_trajectory
-                )
-
-        plan_like_result = SimpleNamespace(trajectory=robot_trajectory)
-
-        self.get_logger().info("PLAN CARTESIANO POR WAYPOINTS OK ✓")
-        return True, "CARTESIAN_WAYPOINT_PLAN_SUCCEEDED", plan_like_result
-
-
     def arm_go_to_pose_cartesian(
         self,
         arm: str,
@@ -1195,7 +773,7 @@ class UrDualMoveItPy(Node):
         velocity_scaling: float = 0.05,
         acceleration_scaling: float = 0.05,
     ):
-        """Planifica, y opcionalmente ejecuta, una trayectoria cartesiana real."""
+        """Plan (and optionally execute) a real single-pose Cartesian move."""
 
         success, status, plan_result = self.cartesian_plan_to_pose(
             arm=arm,
@@ -1221,10 +799,8 @@ class UrDualMoveItPy(Node):
 
         return True, status, plan_result
 
-
     def shutdown(self):
-        """Cierre explícito del wrapper."""
-
+        """Explicit wrapper shutdown."""
         try:
             self.robot.shutdown()
         except Exception:
