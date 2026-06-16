@@ -1,21 +1,11 @@
 /oak_cam/oak:
   ros__parameters:
-    # ============================================================
-    # Driver level - proyector IR a máximo (CLAVE para mesa lisa)
-    # ============================================================
     driver.r_laser_dot_intensity: 1.0
     driver.r_floodlight_intensity: 0.0
 
-    # ============================================================
-    # Pipeline: solo Depth + RGB (no NN aquí, YOLO va aparte)
-    # ============================================================
     pipeline_gen.i_pipeline_type: "RGBD"
     pipeline_gen.i_enable_imu: false
 
-    # ============================================================
-    # Sensores stereo - exposición manual anti-flicker
-    # 10000 us = 10 ms = 1 ciclo de fluorescente (100 Hz en EU)
-    # ============================================================
     left.i_fps: 15.0
     left.i_width: 640
     left.i_height: 400
@@ -30,48 +20,33 @@
     right.r_exposure: 10000
     right.r_iso: 400
 
-    # ============================================================
-    # RGB para visualizacion (no critico para depth)
-    # ============================================================
     rgb.i_fps: 15.0
     rgb.i_width: 640
     rgb.i_height: 400
 
-    # ============================================================
-    # STEREO - el corazon del fix
-    # ============================================================
     stereo.i_fps: 15.0
     stereo.i_subpixel: true
 
-    # Confidence: ALTO descarta matches poco confiables (mesa lisa)
     stereo.i_stereo_conf_threshold: 200
 
-    # LR check estricto
     stereo.i_lrc_threshold: 5
 
-    # Bilateral (suaviza dentro de regiones similares)
     stereo.i_bilateral_sigma: 5
 
-    # ---- Filtros post-procesado ----
-
-    # Speckle: mata puntos aislados (RUIDO ALEATORIO)
     stereo.i_enable_speckle_filter: true
     stereo.i_speckle_filter_speckle_range: 60
 
-    # Temporal: promedia en el tiempo (RUIDO POR FLICKER)
     stereo.i_enable_temporal_filter: true
     stereo.i_temporal_filter_alpha: 0.3
     stereo.i_temporal_filter_delta: 20
     stereo.i_temporal_filter_persistency: "VALID_2_IN_LAST_4"
 
-    # Spatial: suaviza vecinos similares
     stereo.i_enable_spatial_filter: true
     stereo.i_spatial_filter_hole_filling_radius: 2
     stereo.i_spatial_filter_alpha: 0.5
     stereo.i_spatial_filter_delta: 20
     stereo.i_spatial_filter_num_iterations: 2
 
-    # Threshold: solo profundidad util (20 cm a 1.5 m)
     stereo.i_enable_threshold_filter: true
     stereo.i_threshold_filter_min_range: 200
     stereo.i_threshold_filter_max_range: 1500
